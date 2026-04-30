@@ -1063,7 +1063,8 @@ func cmdLog(args []string) {
 				}
 			}
 			level := strings.ToUpper(string(e.Type))
-			fmt.Printf("[console] %s: %s\n", level, strings.Join(parts, " "))
+			ts := time.Now().Format("15:04:05.000")
+			fmt.Printf("%s [console] %s: %s\n", ts, level, strings.Join(parts, " "))
 		})
 	}
 
@@ -1073,18 +1074,16 @@ func cmdLog(args []string) {
 			if e.ExceptionDetails.Exception != nil && e.ExceptionDetails.Exception.Description != "" {
 				text = e.ExceptionDetails.Exception.Description
 			}
-			fmt.Printf("[error] %s\n", text)
+			ts := time.Now().Format("15:04:05.000")
+			fmt.Printf("%s [error] %s\n", ts, text)
 		})
 	}
 
 	if filter == "" || filter == "network" {
 		callbacks = append(callbacks, func(e *proto.NetworkResponseReceived) {
 			r := e.Response
-			u := r.URL
-			if len(u) > 80 {
-				u = u[:80] + "..."
-			}
-			fmt.Printf("[net] %d %s (%s)\n", r.Status, u, r.MIMEType)
+			ts := time.Now().Format("15:04:05.000")
+			fmt.Printf("%s [net] %d %s (%s)\n", ts, r.Status, r.URL, r.MIMEType)
 		})
 	}
 
