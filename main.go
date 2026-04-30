@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"time"
@@ -11,12 +13,16 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 )
 
 const (
 	cdpFile   = "/tmp/web-control-cdp.txt"
 	frameFile = "/tmp/web-control-frame.txt"
+	pageFile  = "/tmp/web-control-page.txt"
 )
+
+var globalTimeout = 5 * time.Second
 
 // ── Element extraction JS (same as web.py) ────────────────────
 const extractJS = `() => {
@@ -24,7 +30,8 @@ const extractJS = `() => {
 	const results = [];
 	function walk(root) {
 		const els = root.querySelectorAll([
-			'a[href]','button','input','select','textarea',
+			'a[href]','a.btn','a[data-toggle]','a[data-action]','a[data-bs-toggle]',
+			'button','input','select','textarea',
 			'[role="button"]','[role="link"]','[role="tab"]',
 			'[role="menuitem"]','[role="checkbox"]','[role="radio"]',
 			'[role="switch"]','[role="combobox"]','[role="textbox"]',
@@ -155,7 +162,7 @@ func formatElement(e element) string {
 func connectBrowser() *rod.Browser {
 	data, err := os.ReadFile(cdpFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "ERROR: no browser running. Use 'web launch' first.")
+		fmt.Fprintln(os.Stderr, "ERROR: no browser running. Use 'wdb launch' first.")
 		os.Exit(1)
 	}
 	wsURL := strings.TrimSpace(string(data))
@@ -165,6 +172,14 @@ func connectBrowser() *rod.Browser {
 
 func getPage(browser *rod.Browser) *rod.Page {
 	pages := browser.MustPages()
+	// Check if a specific tab was selected via `tabs N`
+	if data, err := os.ReadFile(pageFile); err == nil {
+		idx, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err == nil && idx >= 0 && idx < len(pages) {
+			return pages[idx]
+		}
+	}
+	// Fallback: last non-blank page
 	for i := len(pages) - 1; i >= 0; i-- {
 		info := pages[i].MustInfo()
 		if info.URL != "about:blank" && !strings.HasPrefix(info.URL, "chrome://") {
@@ -233,6 +248,24 @@ func getFrame(page *rod.Page) *rod.Page {
 	return page
 }
 
+func findElement(frame *rod.Page, selector string) *rod.Element {
+	el, err := frame.Timeout(globalTimeout).Element(selector)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: element not found: %s\n", selector)
+		os.Exit(1)
+	}
+	return el
+}
+
+func findElementByText(frame *rod.Page, text string) *rod.Element {
+	el, err := frame.Timeout(globalTimeout).ElementR("*", text)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: no element matching text: %s\n", text)
+		os.Exit(1)
+	}
+	return el
+}
+
 // ── Commands ──────────────────────────────────────────────────
 
 func cmdLaunch(args []string) {
@@ -265,6 +298,7 @@ func cmdStop(args []string) {
 	browser.MustClose()
 	os.Remove(cdpFile)
 	os.Remove(frameFile)
+	os.Remove(pageFile)
 	fmt.Println("Browser closed.")
 }
 
@@ -379,22 +413,88 @@ func cmdFrame(args []string) {
 }
 
 func cmdNavigate(args []string) {
-	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: web navigate <url>"); os.Exit(1) }
+	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: wdb navigate <url|--link sel>"); os.Exit(1) }
 	browser := connectBrowser()
 	page := getPage(browser)
+	frame := getFrame(page)
+
+	if args[0] == "--link" && len(args) > 1 {
+		el := findElement(frame, args[1])
+		href := el.MustEval(`function() { return this.href || this.getAttribute('href') || ''; }`).Str()
+		if href == "" {
+			fmt.Fprintln(os.Stderr, "ERROR: element has no href")
+			os.Exit(1)
+		}
+		frame.MustNavigate(href).MustWaitDOMStable()
+		info := frame.MustInfo()
+		fmt.Printf("-> %s\n   %s\n", info.URL, info.Title)
+		return
+	}
+
 	page.MustNavigate(args[0]).MustWaitDOMStable()
 	info := page.MustInfo()
 	fmt.Printf("-> %s\n   %s\n", info.URL, info.Title)
 }
 
 func cmdClick(args []string) {
-	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: web click <selector>"); os.Exit(1) }
+	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: wdb click <selector>"); os.Exit(1) }
 	browser := connectBrowser()
 	page := getPage(browser)
 	frame := getFrame(page)
 
+	// Parse flags
+	force := false
+	nth := 0
+	var within string
+	var filtered []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--force" {
+			force = true
+		} else if args[i] == "--within" && i+1 < len(args) {
+			i++
+			within = args[i]
+		} else if args[i] == "--nth" && i+1 < len(args) {
+			i++
+			nth, _ = strconv.Atoi(args[i])
+		} else {
+			filtered = append(filtered, args[i])
+		}
+	}
+	args = filtered
+
 	if args[0] == "--text" && len(args) > 1 {
-		frame.MustElementR("*", args[1]).MustClick()
+		var el *rod.Element
+		if within != "" {
+			// Search clickable elements within container
+			parent := findElement(frame, within)
+			var err error
+			el, err = parent.ElementR("a, button, [role=button], [role=link], [role=menuitem], [role=tab]", args[1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: no element matching text %q within %s\n", args[1], within)
+				os.Exit(1)
+			}
+		} else if nth > 0 {
+			// JS-based nth match — click directly and return
+			frame.MustEval(fmt.Sprintf(`(nth) => {
+				const re = new RegExp(%s);
+				const els = document.querySelectorAll('a, button, [role="button"], [role="link"], [role="menuitem"], span, label, li');
+				const matches = [];
+				for (const el of els) {
+					if (re.test(el.textContent.trim()) && el.offsetParent !== null) matches.push(el);
+				}
+				if (nth >= matches.length) throw new Error('--nth ' + nth + ' but only ' + matches.length + ' matches');
+				matches[nth].click();
+			}`, strconv.Quote(args[1])), nth)
+			fmt.Printf("Clicked text: %s (nth: %d)\n", args[1], nth)
+			return
+		} else {
+			el = findElementByText(frame, args[1])
+		}
+		if force {
+			el.MustEval(`function() { this.click(); }`)
+		} else {
+			el.MustClick()
+		}
 		fmt.Printf("Clicked text: %s\n", args[1])
 	} else if args[0] == "--xy" && len(args) > 2 {
 		x, _ := strconv.ParseFloat(args[1], 64)
@@ -404,23 +504,63 @@ func cmdClick(args []string) {
 		page.Mouse.MustUp("left")
 		fmt.Printf("Clicked (%s, %s)\n", args[1], args[2])
 	} else {
-		frame.MustElement(args[0]).MustClick()
+		el := findElement(frame, args[0])
+		if force {
+			el.MustEval(`function() { this.click(); }`)
+		} else {
+			el.MustClick()
+		}
 		fmt.Printf("Clicked: %s\n", args[0])
 	}
 }
 
 func cmdFill(args []string) {
-	if len(args) < 2 { fmt.Fprintln(os.Stderr, "Usage: web fill <selector> <text>"); os.Exit(1) }
+	if len(args) < 2 { fmt.Fprintln(os.Stderr, "Usage: wdb fill <selector> <text>"); os.Exit(1) }
 	browser := connectBrowser()
 	page := getPage(browser)
 	frame := getFrame(page)
-	el := frame.MustElement(args[0])
-	el.MustSelectAllText().MustInput(strings.Join(args[1:], " "))
-	fmt.Printf("Filled %s\n", args[0])
+
+	sel := args[0]
+	text := strings.Join(args[1:], " ")
+
+	el := findElement(frame, sel)
+
+	// Check if the element is hidden (rich text editor replaced it)
+	visible := el.MustEval(`function() { return this.offsetParent !== null && getComputedStyle(this).display !== 'none'; }`).Bool()
+	if !visible {
+		// Try TinyMCE, CKEditor 4, CKEditor 5
+		result := frame.MustEval(fmt.Sprintf(`(content) => {
+			const id = %s;
+			// TinyMCE
+			if (typeof tinyMCE !== 'undefined') {
+				const ed = tinyMCE.get(id);
+				if (ed) { ed.setContent('<p>' + content + '</p>'); return 'tinymce'; }
+			}
+			// CKEditor 4
+			if (typeof CKEDITOR !== 'undefined' && CKEDITOR.instances[id]) {
+				CKEDITOR.instances[id].setData('<p>' + content + '</p>');
+				return 'ckeditor4';
+			}
+			// CKEditor 5 — stored on the element
+			const ta = document.getElementById(id);
+			if (ta && ta.ckeditorInstance) {
+				ta.ckeditorInstance.setData('<p>' + content + '</p>');
+				return 'ckeditor5';
+			}
+			// Fallback: set textarea value directly
+			if (ta) { ta.value = content; return 'textarea'; }
+			return 'not found';
+		}`, strconv.Quote(el.MustProperty("id").Str())), text)
+		fmt.Printf("Filled %s (via %s)\n", sel, result.Str())
+		return
+	}
+
+	el.MustSelectAllText().MustInput(text)
+	fmt.Printf("Filled %s\n", sel)
 }
 
 func cmdType(args []string) {
-	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: web type <text>"); os.Exit(1) }
+	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: wdbtype <text>"); os.Exit(1) }
 	browser := connectBrowser()
 	page := getPage(browser)
 	page.MustInsertText(strings.Join(args, " "))
@@ -467,7 +607,7 @@ func cmdPress(args []string) {
 }
 
 func cmdEval(args []string) {
-	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: web eval <js>"); os.Exit(1) }
+	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: wdbeval <js>"); os.Exit(1) }
 	browser := connectBrowser()
 	page := getPage(browser)
 	frame := getFrame(page)
@@ -503,7 +643,7 @@ func cmdScroll(args []string) {
 }
 
 func cmdWait(args []string) {
-	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: web wait <selector|ms>"); os.Exit(1) }
+	if len(args) == 0 { fmt.Fprintln(os.Stderr, "Usage: wdbwait <selector|ms>"); os.Exit(1) }
 	browser := connectBrowser()
 	page := getPage(browser)
 	frame := getFrame(page)
@@ -512,7 +652,7 @@ func cmdWait(args []string) {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		fmt.Printf("Waited %dms\n", ms)
 	} else {
-		frame.MustElement(args[0])
+		findElement(frame, args[0])
 		fmt.Printf("Found: %s\n", args[0])
 	}
 }
@@ -531,7 +671,7 @@ func cmdSelect(args []string) {
 	browser := connectBrowser()
 	page := getPage(browser)
 	frame := getFrame(page)
-	el := frame.MustElement(args[0])
+	el := findElement(frame, args[0])
 	el.MustSelect(args[1:]...)
 	fmt.Printf("Selected: %s\n", strings.Join(args[1:], ", "))
 }
@@ -542,10 +682,10 @@ func cmdHover(args []string) {
 	page := getPage(browser)
 	frame := getFrame(page)
 	if args[0] == "--text" && len(args) > 1 {
-		frame.MustElementR("*", args[1]).MustHover()
+		findElementByText(frame, args[1]).MustHover()
 		fmt.Printf("Hovered text: %s\n", args[1])
 	} else {
-		frame.MustElement(args[0]).MustHover()
+		findElement(frame, args[0]).MustHover()
 		fmt.Printf("Hovered: %s\n", args[0])
 	}
 }
@@ -583,6 +723,7 @@ func cmdTabs(args []string) {
 	if len(args) > 0 && args[0] == "close" {
 		page := getPage(browser)
 		page.MustClose()
+		os.Remove(pageFile)
 		fmt.Println("Closed current tab")
 		return
 	}
@@ -595,6 +736,7 @@ func cmdTabs(args []string) {
 			os.Exit(1)
 		}
 		pages[idx].MustActivate()
+		os.WriteFile(pageFile, []byte(strconv.Itoa(idx)), 0644)
 		info := pages[idx].MustInfo()
 		fmt.Printf("Switched to tab %d: %s\n", idx, info.Title)
 		return
@@ -620,9 +762,518 @@ func cmdUpload(args []string) {
 	browser := connectBrowser()
 	page := getPage(browser)
 	frame := getFrame(page)
-	el := frame.MustElement(args[0])
+	el := findElement(frame, args[0])
 	el.MustSetFiles(args[1:]...)
 	fmt.Printf("Uploaded %d file(s) to %s\n", len(args)-1, args[0])
+}
+
+func cmdConnect(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: wdb connect <port>")
+		os.Exit(1)
+	}
+	wsURL := args[0]
+	if !strings.HasPrefix(wsURL, "ws") {
+		resolved, err := launcher.ResolveURL("ws://127.0.0.1:" + args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: cannot reach browser on port %s: %v\n", args[0], err)
+			os.Exit(1)
+		}
+		wsURL = resolved
+	}
+	browser := rod.New().ControlURL(wsURL).MustConnect()
+	pages := browser.MustPages()
+	os.WriteFile(cdpFile, []byte(wsURL), 0644)
+	fmt.Printf("Connected (%d tabs)\n", len(pages))
+}
+
+func cmdDrag(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "Usage: wdb drag <from-sel> <to-sel>")
+		os.Exit(1)
+	}
+	browser := connectBrowser()
+	page := getPage(browser)
+	frame := getFrame(page)
+
+	src := findElement(frame, args[0])
+	dst := findElement(frame, args[1])
+
+	src.MustScrollIntoView()
+	srcShape := src.MustShape()
+	sq := srcShape.Quads[0]
+	sx := (sq[0] + sq[2] + sq[4] + sq[6]) / 4
+	sy := (sq[1] + sq[3] + sq[5] + sq[7]) / 4
+
+	dstShape := dst.MustShape()
+	dq := dstShape.Quads[0]
+	dx := (dq[0] + dq[2] + dq[4] + dq[6]) / 4
+	dy := (dq[1] + dq[3] + dq[5] + dq[7]) / 4
+
+	page.Mouse.MustMoveTo(sx, sy)
+	time.Sleep(100 * time.Millisecond)
+	page.Mouse.MustDown("left")
+	time.Sleep(100 * time.Millisecond)
+
+	steps := 20
+	for i := 1; i <= steps; i++ {
+		t := float64(i) / float64(steps)
+		page.Mouse.MustMoveTo(sx+(dx-sx)*t, sy+(dy-sy)*t)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	page.Mouse.MustUp("left")
+	fmt.Printf("Dragged %s -> %s\n", args[0], args[1])
+}
+
+func cmdAssert(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "Usage: wdb assert <selector> <expected-text>")
+		os.Exit(1)
+	}
+	browser := connectBrowser()
+	page := getPage(browser)
+	frame := getFrame(page)
+
+	el := findElement(frame, args[0])
+	text, err := el.Text()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: cannot read text: %v\n", err)
+		os.Exit(1)
+	}
+
+	expected := strings.Join(args[1:], " ")
+	if strings.Contains(text, expected) {
+		fmt.Printf("PASS: %s contains %q\n", args[0], expected)
+	} else {
+		actual := text
+		if len(actual) > 200 {
+			actual = actual[:200] + "..."
+		}
+		fmt.Fprintf(os.Stderr, "FAIL: %s does not contain %q\n", args[0], expected)
+		fmt.Fprintf(os.Stderr, "  got: %s\n", actual)
+		os.Exit(1)
+	}
+}
+
+func cmdCookie(args []string) {
+	browser := connectBrowser()
+	page := getPage(browser)
+
+	// Delete
+	if len(args) >= 2 && args[0] == "--delete" {
+		name := args[1]
+		cookies, err := page.Cookies(nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		for _, c := range cookies {
+			if c.Name == name {
+				err := proto.NetworkDeleteCookies{Name: c.Name, Domain: c.Domain, Path: c.Path}.Call(page)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("Deleted: %s\n", name)
+				return
+			}
+		}
+		fmt.Fprintf(os.Stderr, "ERROR: cookie not found: %s\n", name)
+		os.Exit(1)
+	}
+
+	// Set
+	if len(args) >= 2 && args[0] == "--set" {
+		parts := strings.SplitN(args[1], "=", 2)
+		if len(parts) != 2 {
+			fmt.Fprintln(os.Stderr, "Usage: wdb cookie --set name=value")
+			os.Exit(1)
+		}
+		info := page.MustInfo()
+		page.MustSetCookies(&proto.NetworkCookieParam{
+			Name:  parts[0],
+			Value: parts[1],
+			URL:   info.URL,
+		})
+		fmt.Printf("Set: %s=%s\n", parts[0], parts[1])
+		return
+	}
+
+	// Get specific
+	cookies, err := page.Cookies(nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	if len(args) == 1 {
+		for _, c := range cookies {
+			if c.Name == args[0] {
+				fmt.Printf("Name:     %s\nValue:    %s\nDomain:   %s\nPath:     %s\nSecure:   %v\nHttpOnly: %v\n",
+					c.Name, c.Value, c.Domain, c.Path, c.Secure, c.HTTPOnly)
+				if c.Expires > 0 {
+					fmt.Printf("Expires:  %s\n", time.Unix(int64(c.Expires), 0).Format(time.RFC3339))
+				}
+				return
+			}
+		}
+		fmt.Fprintf(os.Stderr, "ERROR: cookie not found: %s\n", args[0])
+		os.Exit(1)
+	}
+
+	// List all
+	if len(cookies) == 0 {
+		fmt.Println("No cookies.")
+		return
+	}
+	for _, c := range cookies {
+		v := c.Value
+		if len(v) > 60 {
+			v = v[:60] + "..."
+		}
+		fmt.Printf("%-30s  %s\n", c.Name, v)
+	}
+	fmt.Printf("\n(%d cookies)\n", len(cookies))
+}
+
+// ── Map JS ───────────────────────────────────────────────────
+
+const mapJS = `() => {
+	const sections = [];
+	const seen = new Set();
+	function walkUl(ul) {
+		const items = [];
+		for (const li of ul.children) {
+			if (li.tagName !== 'LI') continue;
+			const a = li.querySelector(':scope > a, :scope > button, :scope > span > a');
+			if (!a || seen.has(a)) continue;
+			seen.add(a);
+			const text = (a.getAttribute('aria-label') || a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80);
+			if (!text) continue;
+			const href = a.tagName === 'A' ? (a.getAttribute('href') || '').substring(0, 120) : '';
+			const sub = li.querySelector(':scope > ul, :scope > ol');
+			const children = sub ? walkUl(sub) : [];
+			items.push({text, href, children});
+		}
+		return items;
+	}
+	const navs = document.querySelectorAll('nav, [role="navigation"], [role="menubar"], aside, [role="complementary"]');
+	for (const nav of navs) {
+		if (seen.has(nav)) continue;
+		seen.add(nav);
+		const label = nav.getAttribute('aria-label') || nav.id || nav.tagName.toLowerCase();
+		const ul = nav.querySelector('ul, ol');
+		if (!ul) continue;
+		const items = walkUl(ul);
+		if (items.length) sections.push({label, items});
+	}
+	return sections;
+}`
+
+type mapItem struct {
+	Text     string    `json:"text"`
+	Href     string    `json:"href"`
+	Children []mapItem `json:"children"`
+}
+
+type mapSection struct {
+	Label string    `json:"label"`
+	Items []mapItem `json:"items"`
+}
+
+func printMapItems(items []mapItem, indent int) {
+	for _, item := range items {
+		prefix := strings.Repeat("  ", indent)
+		fmt.Printf("%s%s\n", prefix, item.Text)
+		printMapItems(item.Children, indent+1)
+	}
+}
+
+func cmdMap(args []string) {
+	browser := connectBrowser()
+	page := getPage(browser)
+	frame := getFrame(page)
+
+	result := frame.MustEval(mapJS)
+	raw, err := result.MarshalJSON()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	var sections []mapSection
+	if err := json.Unmarshal(raw, &sections); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(sections) == 0 {
+		fmt.Println("No navigation structures found.")
+		return
+	}
+
+	for _, s := range sections {
+		fmt.Printf("── %s ──\n", s.Label)
+		printMapItems(s.Items, 1)
+		fmt.Println()
+	}
+}
+
+func cmdLog(args []string) {
+	browser := connectBrowser()
+	page := getPage(browser)
+
+	filter := ""
+	if len(args) > 0 {
+		filter = args[0]
+	}
+
+	proto.RuntimeEnable{}.Call(page)
+	if filter == "" || filter == "network" {
+		proto.NetworkEnable{}.Call(page)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr, "\nStopped.")
+		cancel()
+	}()
+
+	pCtx := page.Context(ctx)
+	fmt.Fprintln(os.Stderr, "Streaming logs (Ctrl+C to stop)...")
+
+	var callbacks []interface{}
+
+	if filter == "" || filter == "console" || filter == "errors" {
+		callbacks = append(callbacks, func(e *proto.RuntimeConsoleAPICalled) {
+			if filter == "errors" && string(e.Type) != "error" && string(e.Type) != "warning" {
+				return
+			}
+			var parts []string
+			for _, arg := range e.Args {
+				if !arg.Value.Nil() {
+					parts = append(parts, arg.Value.String())
+				} else if arg.Description != "" {
+					parts = append(parts, arg.Description)
+				}
+			}
+			level := strings.ToUpper(string(e.Type))
+			fmt.Printf("[console] %s: %s\n", level, strings.Join(parts, " "))
+		})
+	}
+
+	if filter == "" || filter == "errors" {
+		callbacks = append(callbacks, func(e *proto.RuntimeExceptionThrown) {
+			text := e.ExceptionDetails.Text
+			if e.ExceptionDetails.Exception != nil && e.ExceptionDetails.Exception.Description != "" {
+				text = e.ExceptionDetails.Exception.Description
+			}
+			fmt.Printf("[error] %s\n", text)
+		})
+	}
+
+	if filter == "" || filter == "network" {
+		callbacks = append(callbacks, func(e *proto.NetworkResponseReceived) {
+			r := e.Response
+			u := r.URL
+			if len(u) > 80 {
+				u = u[:80] + "..."
+			}
+			fmt.Printf("[net] %d %s (%s)\n", r.Status, u, r.MIMEType)
+		})
+	}
+
+	if len(callbacks) == 0 {
+		fmt.Fprintf(os.Stderr, "ERROR: unknown filter %q (use: console, network, errors)\n", filter)
+		os.Exit(1)
+	}
+
+	wait := pCtx.EachEvent(callbacks...)
+	wait()
+}
+
+func cmdStorage(args []string) {
+	browser := connectBrowser()
+	page := getPage(browser)
+	frame := getFrame(page)
+
+	storageType := "localStorage"
+	var filtered []string
+	for _, a := range args {
+		if a == "--session" {
+			storageType = "sessionStorage"
+		} else {
+			filtered = append(filtered, a)
+		}
+	}
+	args = filtered
+
+	// Delete
+	if len(args) >= 2 && args[0] == "--delete" {
+		frame.MustEval(fmt.Sprintf(`() => %s.removeItem(%q)`, storageType, args[1]))
+		fmt.Printf("Deleted: %s\n", args[1])
+		return
+	}
+
+	// Set
+	if len(args) >= 2 && args[0] == "--set" {
+		parts := strings.SplitN(args[1], "=", 2)
+		if len(parts) != 2 {
+			fmt.Fprintln(os.Stderr, "Usage: wdb storage --set key=value")
+			os.Exit(1)
+		}
+		frame.MustEval(fmt.Sprintf(`() => %s.setItem(%q, %q)`, storageType, parts[0], parts[1]))
+		fmt.Printf("Set: %s=%s\n", parts[0], parts[1])
+		return
+	}
+
+	// Get specific
+	if len(args) == 1 {
+		result := frame.MustEval(fmt.Sprintf(`() => %s.getItem(%q)`, storageType, args[0]))
+		if result.Nil() {
+			fmt.Fprintf(os.Stderr, "ERROR: key not found: %s\n", args[0])
+			os.Exit(1)
+		}
+		fmt.Println(result.Str())
+		return
+	}
+
+	// List all
+	result := frame.MustEval(fmt.Sprintf(`() => {
+		const items = [];
+		for (let i = 0; i < %s.length; i++) {
+			const key = %s.key(i);
+			const val = %s.getItem(key);
+			items.push({key, val});
+		}
+		return items;
+	}`, storageType, storageType, storageType))
+
+	raw, _ := result.MarshalJSON()
+	var items []struct {
+		Key string `json:"key"`
+		Val string `json:"val"`
+	}
+	json.Unmarshal(raw, &items)
+
+	if len(items) == 0 {
+		fmt.Printf("No %s items.\n", storageType)
+		return
+	}
+	for _, item := range items {
+		v := item.Val
+		if len(v) > 60 {
+			v = v[:60] + "..."
+		}
+		fmt.Printf("%-30s  %s\n", item.Key, v)
+	}
+	fmt.Printf("\n(%d items)\n", len(items))
+}
+
+func cmdHighlight(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: wdb highlight <selector>")
+		os.Exit(1)
+	}
+	browser := connectBrowser()
+	page := getPage(browser)
+	frame := getFrame(page)
+
+	el := findElement(frame, args[0])
+	el.MustEval(`function() {
+		const box = this.getBoundingClientRect();
+		const overlay = document.createElement('div');
+		overlay.style.cssText = 'position:fixed;z-index:999999;pointer-events:none;' +
+			'border:3px solid red;background:rgba(255,0,0,0.15);' +
+			'top:'+box.top+'px;left:'+box.left+'px;width:'+box.width+'px;height:'+box.height+'px;' +
+			'transition:opacity 0.5s;';
+		document.body.appendChild(overlay);
+		setTimeout(function(){ overlay.style.opacity = '0'; }, 1500);
+		setTimeout(function(){ overlay.remove(); }, 2000);
+	}`)
+	fmt.Printf("Highlighted: %s\n", args[0])
+}
+
+func cmdText(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: wdb text <selector>")
+		os.Exit(1)
+	}
+
+	all := false
+	var filtered []string
+	for _, a := range args {
+		if a == "--all" {
+			all = true
+		} else {
+			filtered = append(filtered, a)
+		}
+	}
+	args = filtered
+
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: wdb text <selector>")
+		os.Exit(1)
+	}
+
+	browser := connectBrowser()
+	page := getPage(browser)
+	frame := getFrame(page)
+
+	if all {
+		els, err := frame.Timeout(globalTimeout).Elements(args[0])
+		if err != nil || len(els) == 0 {
+			fmt.Fprintf(os.Stderr, "ERROR: no elements found: %s\n", args[0])
+			os.Exit(1)
+		}
+		for i, el := range els {
+			text, err := el.Text()
+			if err != nil {
+				continue
+			}
+			text = strings.TrimSpace(text)
+			if text == "" {
+				continue
+			}
+			fmt.Printf("[%d] %s\n", i, text)
+		}
+		return
+	}
+
+	el := findElement(frame, args[0])
+	text, err := el.Text()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: cannot read text: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(text)
+}
+
+func cmdSource(args []string) {
+	browser := connectBrowser()
+	page := getPage(browser)
+	frame := getFrame(page)
+	if len(args) == 0 {
+		html, err := frame.HTML()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: cannot read HTML: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(html)
+		return
+	}
+	el := findElement(frame, args[0])
+	html, err := el.HTML()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: cannot read HTML: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(html)
 }
 
 // ── Main ──────────────────────────────────────────────────────
@@ -633,15 +1284,17 @@ func main() {
 		fmt.Println()
 		fmt.Println("Commands:")
 		fmt.Println("  launch [url]        Launch browser")
+		fmt.Println("  connect <port>      Attach to debug port")
 		fmt.Println("  stop                Close browser")
 		fmt.Println("  ui [--all|--json|--filter x|--limit n]")
-		fmt.Println("  click <sel>         Click (or --text/--xy)")
+		fmt.Println("  map                 Show navigation structure")
+		fmt.Println("  click <sel>         Click (--text/--xy/--force/--within/--nth)")
 		fmt.Println("  fill <sel> <text>   Clear + type")
 		fmt.Println("  type <text>         Type into focused")
 		fmt.Println("  press <key>         Press key (Enter, Tab, Escape...)")
 		fmt.Println("  select <sel> <opt>  Select dropdown option by text")
 		fmt.Println("  hover <sel>         Hover (or --text)")
-		fmt.Println("  navigate <url>      Go to URL")
+		fmt.Println("  navigate <url|--link sel>  Go to URL or follow link")
 		fmt.Println("  back                Navigate back")
 		fmt.Println("  forward             Navigate forward")
 		fmt.Println("  reload              Reload page")
@@ -651,14 +1304,49 @@ func main() {
 		fmt.Println("  frames              List frames")
 		fmt.Println("  frame <n|n.n|url|main>  Switch frame (chain: 0.0)")
 		fmt.Println("  upload <sel> <file> Upload file(s)")
+		fmt.Println("  text <sel> [--all]   Read visible text content")
+		fmt.Println("  source [sel]        Dump HTML (page or element)")
+		fmt.Println("  cookie [name|--set k=v|--delete k]")
+		fmt.Println("  storage [key|--set k=v|--delete k] [--session]")
+		fmt.Println("  drag <sel> <sel>    Drag element to element")
+		fmt.Println("  assert <sel> <text> Verify element text")
+		fmt.Println("  highlight <sel>     Flash element overlay")
 		fmt.Println("  eval <js>           Run JavaScript")
 		fmt.Println("  wait <sel|ms>       Wait for element/time")
 		fmt.Println("  screenshot [path]   Screenshot")
+		fmt.Println("  log [console|network|errors]  Stream events")
+		fmt.Println()
+		fmt.Println("Global flags:")
+		fmt.Println("  --timeout <ms>      Element lookup timeout (default 5000)")
 		os.Exit(0)
 	}
 
-	cmd := os.Args[1]
-	args := os.Args[2:]
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", r)
+			os.Exit(1)
+		}
+	}()
+
+	// Parse global flags
+	var cmdArgs []string
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--timeout" && i+1 < len(os.Args) {
+			ms, _ := strconv.Atoi(os.Args[i+1])
+			if ms > 0 {
+				globalTimeout = time.Duration(ms) * time.Millisecond
+			}
+			i++
+		} else {
+			cmdArgs = append(cmdArgs, os.Args[i])
+		}
+	}
+	if len(cmdArgs) == 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: no command specified")
+		os.Exit(1)
+	}
+	cmd := cmdArgs[0]
+	args := cmdArgs[1:]
 
 	switch cmd {
 	case "launch":     cmdLaunch(args)
@@ -680,6 +1368,16 @@ func main() {
 	case "frames":     cmdFrames(args)
 	case "frame":      cmdFrame(args)
 	case "upload":     cmdUpload(args)
+	case "text":       cmdText(args)
+	case "source":     cmdSource(args)
+	case "connect":    cmdConnect(args)
+	case "cookie":     cmdCookie(args)
+	case "storage":    cmdStorage(args)
+	case "drag":       cmdDrag(args)
+	case "assert":     cmdAssert(args)
+	case "highlight":  cmdHighlight(args)
+	case "log":        cmdLog(args)
+	case "map":        cmdMap(args)
 	case "eval":       cmdEval(args)
 	case "wait":       cmdWait(args)
 	case "screenshot": cmdScreenshot(args)
